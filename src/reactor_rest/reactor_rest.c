@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <signal.h>
 #include <netdb.h>
@@ -20,20 +21,48 @@
 
 void reactor_rest_init(reactor_rest *server, reactor_user_call *call, void *state)
 {
-  *server = (reactor_rest) {0};
+  *server = (reactor_rest) {.state = REACTOR_REST_CLOSED};
   reactor_http_server_init(&server->http_server, reactor_rest_event, server);
   reactor_user_init(&server->user, call, state);
   vector_init(&server->maps, sizeof(reactor_rest_map));
+  vector_release(&server->maps, reactor_rest_release_map);
 }
 
 int reactor_rest_open(reactor_rest *server, char *node, char *service, int flags)
 {
+  int e;
+
   server->flags = flags;
 
   if (flags & REACTOR_REST_ENABLE_CORS)
     reactor_rest_add_match(server, "OPTIONS", NULL, reactor_rest_cors);
 
-  return reactor_http_server_open(&server->http_server, node, service);
+  e = reactor_http_server_open(&server->http_server, node, service);
+  if (e == -1)
+    return -1;
+
+  server->state = REACTOR_REST_OPEN;
+  return 0;
+}
+
+void reactor_rest_close(reactor_rest *server)
+{
+  if (server->state == REACTOR_REST_CLOSED)
+    return;
+
+  if (server->state != REACTOR_REST_CLOSING)
+    {
+      reactor_http_server_close(&server->http_server);
+      server->state = REACTOR_REST_CLOSING;
+    }
+
+  if (server->state != REACTOR_REST_CLOSED &&
+      server->http_server.state == REACTOR_HTTP_SERVER_CLOSED)
+    {
+      server->state = REACTOR_REST_CLOSED;
+      vector_clear(&server->maps);
+      reactor_user_dispatch(&server->user, REACTOR_REST_CLOSE, NULL);
+    }
 }
 
 void reactor_rest_event(void *state, int type, void *data)
@@ -57,6 +86,9 @@ void reactor_rest_event(void *state, int type, void *data)
             return;
         }
       reactor_rest_respond_empty(&request, 404);
+      break;
+    case REACTOR_HTTP_SERVER_CLOSE:
+      reactor_rest_close(server);
       break;
     }
 }
@@ -143,6 +175,20 @@ int reactor_rest_try_map(reactor_rest *server, reactor_rest_map *map, reactor_re
       break;
     }
   return 0;
+}
+
+void reactor_rest_release_map(void *data)
+{
+  reactor_rest_map *map;
+
+  map = data;
+  free(map->method);
+  free(map->path);
+  if (map->regex)
+    {
+      regfree(map->regex);
+      free(map->regex);
+    }
 }
 
 void reactor_rest_respond_fields(reactor_rest_request *request, unsigned status,
